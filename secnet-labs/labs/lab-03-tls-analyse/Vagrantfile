@@ -1,0 +1,273 @@
+# Lab 03 - TLS-Analyse
+# Funktioniert mit Hyper-V (Windows) UND VirtualBox (Windows/Linux/Mac).
+# Provider waehlen mit: vagrant up --provider=virtualbox
+#                    oder: vagrant up --provider=hyperv
+#
+# WICHTIG: v.vm.box und v.vm.network duerfen NICHT innerhalb eines
+# "v.vm.provider do |p| ... end"-Blocks stehen - der wird beim Parsen
+# IMMER komplett ausgefuehrt, unabhaengig vom tatsaechlich genutzten
+# Provider. Sonst werden Box und Netzwerk doppelt registriert (siehe
+# Lab 01 fuer die ausfuehrliche Erklaerung).
+#
+# Ablauf: server wird als erste VM definiert und deshalb von Vagrant
+# als erste vollstaendig hochgefahren+provisioniert, bevor client an
+# der Reihe ist. Der Client kann sich das Server-Zertifikat deshalb
+# einfach per curl vom (bewusst unverschluesselten) Port 80 herunterladen,
+# statt es umstaendlich vom Host aus zwischen den VMs zu kopieren.
+
+provider = (ARGV.find { |a| a.start_with?("--provider=") } || "").split("=")[1] ||
+           ENV["VAGRANT_DEFAULT_PROVIDER"] || "virtualbox"
+
+Vagrant.configure("2") do |config|
+
+  config.vm.define "server" do |s|
+    s.vm.hostname = "server"
+    s.vm.synced_folder ".", "/vagrant", disabled: true
+    s.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+    s.vm.network "private_network",
+      hyperv__switch_name: "lab03-net",
+      virtualbox__intnet:  "lab03-net",
+      ip: "10.30.0.10"
+
+    s.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab03-server"
+      hv.memory = 512
+      hv.cpus   = 1
+    end
+
+    s.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab03-server"
+      vb.memory = 512
+      vb.cpus   = 1
+    end
+
+    s.vm.provision "shell", inline: <<-SHELL
+      set -e
+      mkdir -p /etc/nginx/certs
+
+      # Selbst-signiertes Zertifikat erzeugen (wie im Original-Lab)
+      openssl req -x509 -newkey rsa:2048 \
+        -keyout /etc/nginx/certs/server.key \
+        -out    /etc/nginx/certs/server.crt \
+        -days   365 -nodes \
+        -subj   "/C=DE/ST=NRW/L=Essen/O=FOM Lab/CN=lab03.fom.local" \
+        -addext "subjectAltName=IP:10.30.0.10,DNS:lab03.fom.local" \
+        2>/dev/null
+
+      mkdir -p /usr/share/nginx/html
+      cat > /usr/share/nginx/html/index.html << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>Lab 03 - FOM TLS Lab</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 2rem; }
+    h1   { color: #00d4aa; }
+    code { background: #0f3460; padding: 2px 6px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>FOM Lab-Server</h1>
+  <p>Dieser Server ist erreichbar unter:</p>
+  <ul>
+    <li><code>https://10.30.0.10/</code> (verschluesselt)</li>
+    <li><code>http://10.30.0.10/</code>  (unverschluesselt)</li>
+  </ul>
+  <p>API-Endpunkte:</p>
+  <ul>
+    <li><code>/api/secret</code> - enthaelt sensible Daten</li>
+    <li><code>/api/public</code> - oeffentlicher Endpunkt</li>
+  </ul>
+  <p><em>Lab 03: TLS-Analyse</em></p>
+</body>
+</html>
+HTMLEOF
+
+      # Zertifikat (nur der oeffentliche Teil, keine Geheimnisse) zusaetzlich
+      # in den Web-Root legen, damit der Client es sich selbst herunterladen
+      # kann - ganz ohne Host-seitiges Kopieren zwischen den VMs.
+      cp /etc/nginx/certs/server.crt /usr/share/nginx/html/server.crt
+
+      cat > /etc/nginx/nginx.conf << 'NGINXEOF'
+worker_processes 1;
+events {
+    worker_connections 1024;
+}
+
+http {
+    # --- HTTPS-Server (TLS 1.2 + TLS 1.3) ---
+    server {
+        listen 443 ssl;
+        server_name lab03.fom.local 10.30.0.10;
+
+        ssl_certificate     /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+
+        # Beide Versionen aktiv lassen - fuer den Versionsvergleich
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         HIGH:!aNULL:!MD5;
+
+        # Session-Tickets deaktivieren - bessere Analyse-Sicht
+        ssl_session_tickets off;
+
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+        }
+
+        location /api/secret {
+            add_header Content-Type application/json;
+            return 200 '{"status":"ok","message":"Nur mit TLS sichtbar","data":"S3cr3tD4ta"}';
+        }
+
+        location /api/public {
+            add_header Content-Type application/json;
+            return 200 '{"status":"ok","message":"Oeffentlicher Endpunkt"}';
+        }
+    }
+
+    # --- HTTP (unverschluesselt) fuer Vergleich ---
+    server {
+        listen 80;
+        server_name lab03.fom.local 10.30.0.10;
+
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+        }
+
+        location /api/secret {
+            add_header Content-Type application/json;
+            return 200 '{"status":"ok","message":"ACHTUNG: Unverschluesselt!","data":"S3cr3tD4ta"}';
+        }
+    }
+}
+NGINXEOF
+
+      nginx -t
+      systemctl enable --now nginx
+      systemctl restart nginx
+
+      FINGERPRINT=$(openssl x509 -in /etc/nginx/certs/server.crt -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+      cat > /etc/lab-info << LABINFO
+=== Lab 03: TLS-Analyse ===
+Server:   10.30.0.10  (HTTPS Port 443, HTTP Port 80)
+Client:   10.30.0.20
+Analyst:  10.30.0.30
+
+SHA256-Fingerprint: ${FINGERPRINT}
+
+Leitfrage: Welche Informationen uebertraegt TLS im Klartext,
+           und welche sind verschluesselt?
+LABINFO
+
+      echo "[server] 10.30.0.10 | nginx mit TLS auf 443, Klartext auf 80"
+    SHELL
+  end
+
+  config.vm.define "client" do |c|
+    c.vm.hostname = "client"
+    c.vm.synced_folder ".", "/vagrant", disabled: true
+    c.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+    c.vm.network "private_network",
+      hyperv__switch_name: "lab03-net",
+      virtualbox__intnet:  "lab03-net",
+      ip: "10.30.0.20"
+
+    c.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab03-client"
+      hv.memory = 512
+      hv.cpus   = 1
+    end
+
+    c.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab03-client"
+      vb.memory = 512
+      vb.cpus   = 1
+    end
+
+    c.vm.provision "shell", inline: <<-SHELL
+      set -e
+      # server ist zu diesem Zeitpunkt bereits vollstaendig hochgefahren
+      # und provisioniert (Vagrant bringt Multi-Machine-Setups in der
+      # Reihenfolge hoch, in der sie im Vagrantfile definiert sind).
+      for i in 1 2 3 4 5; do
+        curl -sf http://10.30.0.10/server.crt -o /home/vagrant/server.crt && break
+        echo "warte auf server..."; sleep 3
+      done
+      chown vagrant:vagrant /home/vagrant/server.crt
+
+      echo 'alias server-connect="openssl s_client -connect 10.30.0.10:443 -CAfile /home/vagrant/server.crt"' >> /home/vagrant/.bashrc
+
+      FINGERPRINT=$(openssl x509 -in /home/vagrant/server.crt -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+      cat > /home/vagrant/expected-fingerprint.txt << FPEOF
+SHA256-Fingerprint des Serverzertifikats:
+${FINGERPRINT}
+FPEOF
+      chown vagrant:vagrant /home/vagrant/expected-fingerprint.txt
+
+      cat > /etc/lab-info << LABINFO
+=== Lab 03: TLS-Analyse ===
+Server:   10.30.0.10  (HTTPS Port 443)
+Client:   10.30.0.20  (dieser Host)
+Analyst:  10.30.0.30
+
+Zertifikat liegt bereits unter ~/server.crt (automatisch heruntergeladen).
+
+Aufgaben:
+  A1  TLS-Handshake mit openssl s_client beobachten
+  A2  Zertifikat analysieren (Felder, Gueltigkeit, Fingerprint)
+  A3  Netzwerkverkehr mit tshark aufzeichnen und auswerten (auf analyst)
+  A4  TLS-Versionen und Cipher Suites vergleichen
+  A5  Reflexion: Was schuetzt TLS - und was nicht?
+LABINFO
+
+      echo "[client] 10.30.0.20 | Server-Zertifikat unter ~/server.crt"
+    SHELL
+  end
+
+  config.vm.define "analyst" do |a|
+    a.vm.hostname = "analyst"
+    a.vm.synced_folder ".", "/vagrant", disabled: true
+    a.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+    a.vm.network "private_network",
+      hyperv__switch_name: "lab03-net",
+      virtualbox__intnet:  "lab03-net",
+      ip: "10.30.0.30"
+
+    a.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab03-analyst"
+      hv.memory = 512
+      hv.cpus   = 1
+    end
+
+    a.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab03-analyst"
+      vb.memory = 512
+      vb.cpus   = 1
+      # analyst haengt hier nur passiv mit, ist aber nicht Teil des
+      # Traffic-Pfads (anders als attacker in Lab 01 oder mallory in
+      # Lab 02). VirtualBox liefert einer virtuellen NIC standardmaessig
+      # nur Frames, die an ihre eigene MAC adressiert sind (Promiscuous
+      # Mode = "Deny"). Damit tshark/tcpdump hier ueberhaupt fremden
+      # Verkehr zwischen server und client sehen kann, muss das erlaubt
+      # werden. nicpromisc2, weil Adapter 1 immer der NAT-Adapter ist und
+      # Adapter 2 der von uns hinzugefuegte private_network-Adapter.
+      vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    end
+
+    a.vm.provision "shell", inline: <<-SHELL
+      cat > /etc/lab-info << 'LABINFO'
+=== Lab 03: TLS-Analyse ===
+Server:   10.30.0.10  (HTTPS Port 443, HTTP Port 80)
+Client:   10.30.0.20
+Analyst:  10.30.0.30  (dieser Host - tshark vorinstalliert)
+
+Interface fuer tshark/tcpdump mit "ip a" pruefen (meist enp0s8).
+LABINFO
+      echo "[analyst] 10.30.0.30 | tshark bereit"
+    SHELL
+  end
+
+end
