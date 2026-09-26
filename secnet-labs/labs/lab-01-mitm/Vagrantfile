@@ -1,128 +1,119 @@
-# Lab 02 - ARP Spoofing
+# Lab 01 - Man-in-the-Middle
 # Funktioniert mit Hyper-V (Windows) UND VirtualBox (Windows/Linux/Mac).
 # Provider waehlen mit: vagrant up --provider=virtualbox
 #                    oder: vagrant up --provider=hyperv
 #
 # WICHTIG: v.vm.box und v.vm.network duerfen NICHT innerhalb eines
-# "v.vm.provider do |p| ... end"-Blocks stehen - der wird beim Parsen
-# IMMER komplett ausgefuehrt, unabhaengig vom tatsaechlich genutzten
-# Provider. Sonst werden Box und Netzwerk doppelt registriert (siehe
-# Lab 01 fuer die ausfuehrliche Erklaerung).
+# "v.vm.provider do |p| ... end"-Blocks stehen. Dieser Block ist KEIN
+# Conditional - er wird beim Parsen immer komplett ausgefuehrt, egal
+# welcher Provider am Ende genutzt wird. Nur p.memory/p.cpus/p.vmname
+# (Einstellungen auf dem provider-Objekt selbst) sind wirklich
+# provider-spezifisch. Ein v.vm.network-Aufruf in JEDEM Provider-Block
+# wuerde das Netzwerk mehrfach registrieren (-> doppelte/verwaiste
+# Netzwerk-Adapter in VirtualBox). Deshalb hier: Provider einmalig
+# ermitteln und Box/Netzwerk nur einmal setzen.
 
 provider = (ARGV.find { |a| a.start_with?("--provider=") } || "").split("=")[1] ||
            ENV["VAGRANT_DEFAULT_PROVIDER"] || "virtualbox"
 
 Vagrant.configure("2") do |config|
 
-  config.vm.define "alice" do |v|
-    v.vm.hostname = "alice"
+  config.vm.define "victim" do |v|
+    v.vm.hostname = "victim"
     v.vm.synced_folder ".", "/vagrant", disabled: true
     v.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
     v.vm.network "private_network",
-      hyperv__switch_name: "lab02-net",
-      virtualbox__intnet:  "lab02-net",
-      ip: "10.99.99.10"
+      hyperv__switch_name: "lab01-net",
+      virtualbox__intnet:  "lab01-net",
+      ip: "172.30.0.10"
 
     v.vm.provider "hyperv" do |hv|
-      hv.vmname = "lab02-alice"
+      hv.vmname = "lab01-victim"
       hv.memory = 512
       hv.cpus   = 1
     end
 
     v.vm.provider "virtualbox" do |vb|
-      vb.name   = "lab02-alice"
+      vb.name   = "lab01-victim"
       vb.memory = 512
       vb.cpus   = 1
     end
 
     v.vm.provision "shell", inline: <<-SHELL
-      # arp_accept=1 - ohne das verwirft alice unaufgeforderte ARP-Replies
-      # (Gratuitous ARP), ARP-Spoofing wuerde sonst still fehlschlagen
-      IFACE=$(ip -4 route get 10.99.99.1 2>/dev/null | grep -oP 'dev \\K\\S+' | head -1)
-      sysctl -w net.ipv4.conf.all.arp_accept=1
-      sysctl -w net.ipv4.conf.${IFACE}.arp_accept=1 2>/dev/null || true
-      echo "net.ipv4.conf.all.arp_accept=1" >> /etc/sysctl.conf
-
-      # Traffic-Generator: alle 2s HTTP-Request an gateway
-      cat > /usr/local/bin/traffic-gen.sh << 'EOF'
-#!/bin/bash
-while true; do
-  curl -s http://10.99.99.1/ -o /dev/null --max-time 3 2>/dev/null || true
-  sleep 2
-done
-EOF
-      chmod +x /usr/local/bin/traffic-gen.sh
-      nohup /usr/local/bin/traffic-gen.sh > /var/log/traffic-gen.log 2>&1 &
-
-      cat > /etc/lab-info << 'EOF'
-Lab 02 - Netzwerk
-  alice   10.99.99.10  (Opfer)
-  gateway 10.99.99.1   (Webserver, Port 80)
-  mallory 10.99.99.99  (Angreifer)
-EOF
-      echo "[alice] 10.99.99.10 bereit"
+      # Route zum Server zwingend ueber attacker leiten
+      ip route del 172.30.0.20/32 2>/dev/null || true
+      ip route add 172.30.0.20 via 172.30.0.99
+      echo "[victim] 172.30.0.10 | Route zu server via attacker (172.30.0.99)"
     SHELL
   end
 
-  config.vm.define "gateway" do |g|
-    g.vm.hostname = "gateway"
-    g.vm.synced_folder ".", "/vagrant", disabled: true
-    g.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
-    g.vm.network "private_network",
-      hyperv__switch_name: "lab02-net",
-      virtualbox__intnet:  "lab02-net",
-      ip: "10.99.99.1"
+  config.vm.define "attacker" do |a|
+    a.vm.hostname = "attacker"
+    a.vm.synced_folder ".", "/vagrant", disabled: true
+    a.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+    a.vm.network "private_network",
+      hyperv__switch_name: "lab01-net",
+      virtualbox__intnet:  "lab01-net",
+      ip: "172.30.0.99"
 
-    g.vm.provider "hyperv" do |hv|
-      hv.vmname = "lab02-gateway"
+    a.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab01-attacker"
       hv.memory = 512
       hv.cpus   = 1
     end
 
-    g.vm.provider "virtualbox" do |vb|
-      vb.name   = "lab02-gateway"
+    a.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab01-attacker"
       vb.memory = 512
       vb.cpus   = 1
     end
 
-    g.vm.provision "shell", inline: <<-SHELL
+    a.vm.provision "shell", inline: <<-SHELL
       sysctl -w net.ipv4.ip_forward=1
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-
-      mkdir -p /var/www/html
-      cat > /var/www/html/index.html << 'EOF'
-<html><head><title>Firmen-Intranet</title></head><body>
-<h1>Firmen-Intranet</h1><p>Benutzername: admin</p>
-<p>Passwort: SuperGeheim123</p></body></html>
-EOF
-      systemctl enable --now nginx
-      echo "[gateway] 10.99.99.1 - HTTP-Server laeuft auf Port 80"
+      echo "[attacker] 172.30.0.99 | IP-Forwarding aktiv, tcpdump bereit"
     SHELL
   end
 
-  config.vm.define "mallory" do |m|
-    m.vm.hostname = "mallory"
-    m.vm.synced_folder ".", "/vagrant", disabled: true
-    m.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
-    m.vm.network "private_network",
-      hyperv__switch_name: "lab02-net",
-      virtualbox__intnet:  "lab02-net",
-      ip: "10.99.99.99"
+  config.vm.define "server" do |s|
+    s.vm.hostname = "server"
+    s.vm.synced_folder ".", "/vagrant", disabled: true
+    s.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+    s.vm.network "private_network",
+      hyperv__switch_name: "lab01-net",
+      virtualbox__intnet:  "lab01-net",
+      ip: "172.30.0.20"
 
-    m.vm.provider "hyperv" do |hv|
-      hv.vmname = "lab02-mallory"
-      hv.memory = 768
+    s.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab01-server"
+      hv.memory = 512
       hv.cpus   = 1
     end
 
-    m.vm.provider "virtualbox" do |vb|
-      vb.name   = "lab02-mallory"
-      vb.memory = 768
+    s.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab01-server"
+      vb.memory = 512
       vb.cpus   = 1
     end
 
-    m.vm.provision "shell", inline: <<-SHELL
-      echo "[mallory] 10.99.99.99 bereit - ettercap/dsniff vorinstalliert"
+    s.vm.provision "shell", inline: <<-SHELL
+      # Rueckweg ebenfalls ueber attacker zwingen - ohne das wuerde die
+      # Antwort per normalem ARP direkt an victim gehen (gleiches L2-Netz)
+      # und am attacker komplett vorbeilaufen (asymmetrisches Routing).
+      ip route del 172.30.0.10/32 2>/dev/null || true
+      ip route add 172.30.0.10 via 172.30.0.99
+
+      mkdir -p /var/www
+      cat > /var/www/index.html << 'HTMLEOF'
+Internes Mitarbeiterportal
+==========================
+Status:    Anmeldung erfolgreich
+Benutzer:  muster
+Passwort:  Sommer2026!
+Abteilung: IT-Infrastruktur
+HTMLEOF
+      cd /var/www && nohup python3 -m http.server 8080 > /var/log/httpserver.log 2>&1 &
+      echo "[server] HTTP-Server laeuft auf 172.30.0.20:8080 | Rueckweg via attacker (172.30.0.99)"
     SHELL
   end
 
