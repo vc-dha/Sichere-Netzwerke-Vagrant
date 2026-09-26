@@ -81,6 +81,12 @@ Vagrant.configure("2") do |config|
     end
 
     s.vm.provision "shell", inline: <<-SHELL
+      # Rueckweg ebenfalls ueber attacker zwingen - ohne das wuerde die
+      # Antwort per normalem ARP direkt an victim gehen (gleiches L2-Netz)
+      # und am attacker komplett vorbeilaufen (asymmetrisches Routing).
+      ip route del 172.30.0.10/32 2>/dev/null || true
+      ip route add 172.30.0.10 via 172.30.0.99
+
       mkdir -p /var/www
       cat > /var/www/index.html << 'HTMLEOF'
 Internes Mitarbeiterportal
@@ -91,7 +97,7 @@ Passwort:  Sommer2026!
 Abteilung: IT-Infrastruktur
 HTMLEOF
       cd /var/www && nohup python3 -m http.server 8080 > /var/log/httpserver.log 2>&1 &
-      echo "[server] HTTP-Server laeuft auf 172.30.0.20:8080"
+      echo "[server] HTTP-Server laeuft auf 172.30.0.20:8080 | Rueckweg via attacker (172.30.0.99)"
     SHELL
   end
 
