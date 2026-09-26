@@ -2,27 +2,37 @@
 # Funktioniert mit Hyper-V (Windows) UND VirtualBox (Windows/Linux/Mac).
 # Provider waehlen mit: vagrant up --provider=virtualbox
 #                    oder: vagrant up --provider=hyperv
+#
+# WICHTIG: v.vm.box und v.vm.network duerfen NICHT innerhalb eines
+# "v.vm.provider do |p| ... end"-Blocks stehen - der wird beim Parsen
+# IMMER komplett ausgefuehrt, unabhaengig vom tatsaechlich genutzten
+# Provider. Sonst werden Box und Netzwerk doppelt registriert (siehe
+# Lab 01 fuer die ausfuehrliche Erklaerung).
+
+provider = (ARGV.find { |a| a.start_with?("--provider=") } || "").split("=")[1] ||
+           ENV["VAGRANT_DEFAULT_PROVIDER"] || "virtualbox"
 
 Vagrant.configure("2") do |config|
 
   config.vm.define "alice" do |v|
     v.vm.hostname = "alice"
     v.vm.synced_folder ".", "/vagrant", disabled: true
+    v.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+    v.vm.network "private_network",
+      hyperv__switch_name: "lab02-net",
+      virtualbox__intnet:  "lab02-net",
+      ip: "10.99.99.10"
 
     v.vm.provider "hyperv" do |hv|
-      v.vm.box = "ubuntu-secnet-hyperv"
       hv.vmname = "lab02-alice"
       hv.memory = 512
       hv.cpus   = 1
-      v.vm.network "private_network", hyperv__switch_name: "lab02-net", ip: "10.99.99.10"
     end
 
     v.vm.provider "virtualbox" do |vb|
-      v.vm.box = "ubuntu-secnet-virtualbox"
       vb.name   = "lab02-alice"
       vb.memory = 512
       vb.cpus   = 1
-      v.vm.network "private_network", virtualbox__intnet: "lab02-net", ip: "10.99.99.10"
     end
 
     v.vm.provision "shell", inline: <<-SHELL
@@ -57,21 +67,22 @@ EOF
   config.vm.define "gateway" do |g|
     g.vm.hostname = "gateway"
     g.vm.synced_folder ".", "/vagrant", disabled: true
+    g.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+    g.vm.network "private_network",
+      hyperv__switch_name: "lab02-net",
+      virtualbox__intnet:  "lab02-net",
+      ip: "10.99.99.1"
 
     g.vm.provider "hyperv" do |hv|
-      g.vm.box = "ubuntu-secnet-hyperv"
       hv.vmname = "lab02-gateway"
       hv.memory = 512
       hv.cpus   = 1
-      g.vm.network "private_network", hyperv__switch_name: "lab02-net", ip: "10.99.99.1"
     end
 
     g.vm.provider "virtualbox" do |vb|
-      g.vm.box = "ubuntu-secnet-virtualbox"
       vb.name   = "lab02-gateway"
       vb.memory = 512
       vb.cpus   = 1
-      g.vm.network "private_network", virtualbox__intnet: "lab02-net", ip: "10.99.99.1"
     end
 
     g.vm.provision "shell", inline: <<-SHELL
@@ -92,21 +103,22 @@ EOF
   config.vm.define "mallory" do |m|
     m.vm.hostname = "mallory"
     m.vm.synced_folder ".", "/vagrant", disabled: true
+    m.vm.box = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+    m.vm.network "private_network",
+      hyperv__switch_name: "lab02-net",
+      virtualbox__intnet:  "lab02-net",
+      ip: "10.99.99.99"
 
     m.vm.provider "hyperv" do |hv|
-      m.vm.box = "ubuntu-secnet-hyperv"
       hv.vmname = "lab02-mallory"
       hv.memory = 768
       hv.cpus   = 1
-      m.vm.network "private_network", hyperv__switch_name: "lab02-net", ip: "10.99.99.99"
     end
 
     m.vm.provider "virtualbox" do |vb|
-      m.vm.box = "ubuntu-secnet-virtualbox"
       vb.name   = "lab02-mallory"
       vb.memory = 768
       vb.cpus   = 1
-      m.vm.network "private_network", virtualbox__intnet: "lab02-net", ip: "10.99.99.99"
     end
 
     m.vm.provision "shell", inline: <<-SHELL
