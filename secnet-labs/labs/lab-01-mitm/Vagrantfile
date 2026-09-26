@@ -1,0 +1,98 @@
+# Lab 01 - Man-in-the-Middle
+# Funktioniert mit Hyper-V (Windows) UND VirtualBox (Windows/Linux/Mac).
+# Provider waehlen mit: vagrant up --provider=virtualbox
+#                    oder: vagrant up --provider=hyperv
+
+Vagrant.configure("2") do |config|
+
+  config.vm.define "victim" do |v|
+    v.vm.hostname = "victim"
+    v.vm.synced_folder ".", "/vagrant", disabled: true
+
+    v.vm.provider "hyperv" do |hv|
+      v.vm.box = "ubuntu-secnet-hyperv"
+      hv.vmname = "lab01-victim"
+      hv.memory = 512
+      hv.cpus   = 1
+      v.vm.network "private_network", hyperv__switch_name: "lab01-net", ip: "172.30.0.10"
+    end
+
+    v.vm.provider "virtualbox" do |vb|
+      v.vm.box = "ubuntu-secnet-virtualbox"
+      vb.name   = "lab01-victim"
+      vb.memory = 512
+      vb.cpus   = 1
+      v.vm.network "private_network", virtualbox__intnet: "lab01-net", ip: "172.30.0.10"
+    end
+
+    v.vm.provision "shell", inline: <<-SHELL
+      # Route zum Server zwingend ueber attacker leiten
+      ip route del 172.30.0.20/32 2>/dev/null || true
+      ip route add 172.30.0.20 via 172.30.0.99
+      echo "[victim] 172.30.0.10 | Route zu server via attacker (172.30.0.99)"
+    SHELL
+  end
+
+  config.vm.define "attacker" do |a|
+    a.vm.hostname = "attacker"
+    a.vm.synced_folder ".", "/vagrant", disabled: true
+
+    a.vm.provider "hyperv" do |hv|
+      a.vm.box = "ubuntu-secnet-hyperv"
+      hv.vmname = "lab01-attacker"
+      hv.memory = 512
+      hv.cpus   = 1
+      a.vm.network "private_network", hyperv__switch_name: "lab01-net", ip: "172.30.0.99"
+    end
+
+    a.vm.provider "virtualbox" do |vb|
+      a.vm.box = "ubuntu-secnet-virtualbox"
+      vb.name   = "lab01-attacker"
+      vb.memory = 512
+      vb.cpus   = 1
+      a.vm.network "private_network", virtualbox__intnet: "lab01-net", ip: "172.30.0.99"
+    end
+
+    a.vm.provision "shell", inline: <<-SHELL
+      sysctl -w net.ipv4.ip_forward=1
+      echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+      echo "[attacker] 172.30.0.99 | IP-Forwarding aktiv, tcpdump bereit"
+    SHELL
+  end
+
+  config.vm.define "server" do |s|
+    s.vm.hostname = "server"
+    s.vm.synced_folder ".", "/vagrant", disabled: true
+
+    s.vm.provider "hyperv" do |hv|
+      s.vm.box = "ubuntu-secnet-hyperv"
+      hv.vmname = "lab01-server"
+      hv.memory = 512
+      hv.cpus   = 1
+      s.vm.network "private_network", hyperv__switch_name: "lab01-net", ip: "172.30.0.20"
+    end
+
+    s.vm.provider "virtualbox" do |vb|
+      s.vm.box = "ubuntu-secnet-virtualbox"
+      vb.name   = "lab01-server"
+      vb.memory = 512
+      vb.cpus   = 1
+      s.vm.network "private_network", virtualbox__intnet: "lab01-net", ip: "172.30.0.20"
+    end
+
+    s.vm.provision "shell", inline: <<-SHELL
+      mkdir -p /var/www
+      cat > /var/www/index.html << 'HTMLEOF'
+Internes Mitarbeiterportal
+==========================
+Status:    Anmeldung erfolgreich
+Benutzer:  muster
+Passwort:  Sommer2026!
+Abteilung: IT-Infrastruktur
+HTMLEOF
+      cd /var/www && nohup python3 -m http.server 8080 > /var/log/httpserver.log 2>&1 &
+      echo "[server] HTTP-Server laeuft auf 172.30.0.20:8080"
+    SHELL
+  end
+
+end

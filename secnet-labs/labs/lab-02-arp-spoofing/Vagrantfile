@@ -1,0 +1,117 @@
+# Lab 02 - ARP Spoofing
+# Funktioniert mit Hyper-V (Windows) UND VirtualBox (Windows/Linux/Mac).
+# Provider waehlen mit: vagrant up --provider=virtualbox
+#                    oder: vagrant up --provider=hyperv
+
+Vagrant.configure("2") do |config|
+
+  config.vm.define "alice" do |v|
+    v.vm.hostname = "alice"
+    v.vm.synced_folder ".", "/vagrant", disabled: true
+
+    v.vm.provider "hyperv" do |hv|
+      v.vm.box = "ubuntu-secnet-hyperv"
+      hv.vmname = "lab02-alice"
+      hv.memory = 512
+      hv.cpus   = 1
+      v.vm.network "private_network", hyperv__switch_name: "lab02-net", ip: "10.99.99.10"
+    end
+
+    v.vm.provider "virtualbox" do |vb|
+      v.vm.box = "ubuntu-secnet-virtualbox"
+      vb.name   = "lab02-alice"
+      vb.memory = 512
+      vb.cpus   = 1
+      v.vm.network "private_network", virtualbox__intnet: "lab02-net", ip: "10.99.99.10"
+    end
+
+    v.vm.provision "shell", inline: <<-SHELL
+      # arp_accept=1 - ohne das verwirft alice unaufgeforderte ARP-Replies
+      # (Gratuitous ARP), ARP-Spoofing wuerde sonst still fehlschlagen
+      IFACE=$(ip -4 route get 10.99.99.1 2>/dev/null | grep -oP 'dev \\K\\S+' | head -1)
+      sysctl -w net.ipv4.conf.all.arp_accept=1
+      sysctl -w net.ipv4.conf.${IFACE}.arp_accept=1 2>/dev/null || true
+      echo "net.ipv4.conf.all.arp_accept=1" >> /etc/sysctl.conf
+
+      # Traffic-Generator: alle 2s HTTP-Request an gateway
+      cat > /usr/local/bin/traffic-gen.sh << 'EOF'
+#!/bin/bash
+while true; do
+  curl -s http://10.99.99.1/ -o /dev/null --max-time 3 2>/dev/null || true
+  sleep 2
+done
+EOF
+      chmod +x /usr/local/bin/traffic-gen.sh
+      nohup /usr/local/bin/traffic-gen.sh > /var/log/traffic-gen.log 2>&1 &
+
+      cat > /etc/lab-info << 'EOF'
+Lab 02 - Netzwerk
+  alice   10.99.99.10  (Opfer)
+  gateway 10.99.99.1   (Webserver, Port 80)
+  mallory 10.99.99.99  (Angreifer)
+EOF
+      echo "[alice] 10.99.99.10 bereit"
+    SHELL
+  end
+
+  config.vm.define "gateway" do |g|
+    g.vm.hostname = "gateway"
+    g.vm.synced_folder ".", "/vagrant", disabled: true
+
+    g.vm.provider "hyperv" do |hv|
+      g.vm.box = "ubuntu-secnet-hyperv"
+      hv.vmname = "lab02-gateway"
+      hv.memory = 512
+      hv.cpus   = 1
+      g.vm.network "private_network", hyperv__switch_name: "lab02-net", ip: "10.99.99.1"
+    end
+
+    g.vm.provider "virtualbox" do |vb|
+      g.vm.box = "ubuntu-secnet-virtualbox"
+      vb.name   = "lab02-gateway"
+      vb.memory = 512
+      vb.cpus   = 1
+      g.vm.network "private_network", virtualbox__intnet: "lab02-net", ip: "10.99.99.1"
+    end
+
+    g.vm.provision "shell", inline: <<-SHELL
+      sysctl -w net.ipv4.ip_forward=1
+      echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+      mkdir -p /var/www/html
+      cat > /var/www/html/index.html << 'EOF'
+<html><head><title>Firmen-Intranet</title></head><body>
+<h1>Firmen-Intranet</h1><p>Benutzername: admin</p>
+<p>Passwort: SuperGeheim123</p></body></html>
+EOF
+      systemctl enable --now nginx
+      echo "[gateway] 10.99.99.1 - HTTP-Server laeuft auf Port 80"
+    SHELL
+  end
+
+  config.vm.define "mallory" do |m|
+    m.vm.hostname = "mallory"
+    m.vm.synced_folder ".", "/vagrant", disabled: true
+
+    m.vm.provider "hyperv" do |hv|
+      m.vm.box = "ubuntu-secnet-hyperv"
+      hv.vmname = "lab02-mallory"
+      hv.memory = 768
+      hv.cpus   = 1
+      m.vm.network "private_network", hyperv__switch_name: "lab02-net", ip: "10.99.99.99"
+    end
+
+    m.vm.provider "virtualbox" do |vb|
+      m.vm.box = "ubuntu-secnet-virtualbox"
+      vb.name   = "lab02-mallory"
+      vb.memory = 768
+      vb.cpus   = 1
+      m.vm.network "private_network", virtualbox__intnet: "lab02-net", ip: "10.99.99.99"
+    end
+
+    m.vm.provision "shell", inline: <<-SHELL
+      echo "[mallory] 10.99.99.99 bereit - ettercap/dsniff vorinstalliert"
+    SHELL
+  end
+
+end

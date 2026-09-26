@@ -1,0 +1,17 @@
+# Gebaute Vagrant-Boxen (mehrere GB, gehoeren nicht ins Repo)
+*.box
+
+# Packer Build-Artefakte
+packer/**/iso_cache/
+packer/**/packer_cache/
+packer/**/output-*/
+packer/**/*.log
+crash.log
+
+# Vagrant lokaler Zustand
+.vagrant/
+
+# Editor-/OS-Muell
+.DS_Store
+Thumbs.db
+*.swp
