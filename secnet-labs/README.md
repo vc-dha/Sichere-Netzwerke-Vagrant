@@ -152,7 +152,7 @@ vagrant up --provider=hyperv
 | 02 | `labs/lab-02-arp-spoofing` | ARP Spoofing | ✅ fertig | `lab02-net` |
 | 03 | `labs/lab-03-tls-analyse` | TLS-Analyse | ✅ fertig | `lab03-net` |
 | 04 | – | BGP-Verkehr-Analyse | – läuft ohne Docker/VMs, siehe Original-Repo | – |
-| 05 | `labs/lab-05-dns-poisoning` | DNS Poisoning | 🚧 in Arbeit | `lab05-net` |
+| 05 | `labs/lab-05-dns-poisoning` | DNS Poisoning | ✅ fertig | `lab05-net` |
 
 Jedes Vagrantfile funktioniert mit **beiden** Providern – einfach beim
 Start mit `--provider=virtualbox` oder `--provider=hyperv` wählen (oder
@@ -218,6 +218,15 @@ stattfinden sollte.
 > sonst verpasst man den Anfang der Verbindung (Request landet dann
 > außerhalb des Mitschnitts).
 
+**Unterschiede zum Original (Docker-Lab):**
+
+| Original (Docker) | Diese Version (Vagrant) |
+|---|---|
+| Container über `docker exec -it` | echte VMs über `vagrant ssh` |
+| Interface heißt `eth1` | Interface heißt `enp0s9`/`enp0s8` (Ubuntu-Namensschema) |
+| `setup.sh` setzte die Route nur beim `victim`-Container, **nicht** beim `server` – dadurch lief der MITM nicht zuverlässig (asymmetrisches Routing: die Antwort ging per normalem ARP direkt zurück zum Opfer, am Angreifer vorbei) | symmetrische Route auf **beiden** Seiten (`victim` **und** `server`) – das war der eigentliche Bugfix, den wir hier gefunden und dem Dozenten gemeldet haben; die offizielle Docker-Version wurde danach identisch korrigiert |
+| Docker-Bridge-Netzwerk | VirtualBox `intnet` / Hyper-V-Switch (verhält sich eher wie ein gemeinsames LAN-Segment) |
+
 ---
 
 ## Lab 02 – ARP Spoofing
@@ -275,6 +284,14 @@ sudo tcpdump -i enp0s8 -n arp
 
 Zeigt die gefälschten "ARP is-at"-Antworten, die mallory laufend
 verschickt, um den Cache-Eintrag frisch zu halten.
+
+**Unterschiede zum Original (Docker-Lab):**
+
+| Original (Docker) | Diese Version (Vagrant) |
+|---|---|
+| Interface heißt `eth0` (Docker-Standard) | Interface heißt `enp0s8` (Ubuntu-Namensschema unter VirtualBox/Hyper-V) |
+| `setup.sh` setzt `net.bridge.bridge-nf-call-iptables=0` u. ä., damit ARP-Spoofing über die Docker-Bridge überhaupt funktioniert (Linux-Bridge/Netfilter-Layer würde sonst dazwischenfunken) | komplett entfällt – VirtualBox `intnet`/Hyper-V-Switch hat keine Netfilter-Schicht dazwischen, ARP-Spoofing funktioniert ohne Sonderkonfiguration |
+| Container über `docker exec -it` | echte VMs über `vagrant ssh` |
 
 ---
 
@@ -397,6 +414,158 @@ Parallel auf client mehrfach anfragen: `curl -sk https://10.30.0.10/api/secret`.
 Auch bei TLS bleiben IP-Adressen und (falls SNI genutzt wird) der
 angefragte Hostname sichtbar.
 
+**Unterschiede zum Original (Docker-Lab):**
+
+| Original (Docker) | Diese Version (Vagrant) |
+|---|---|
+| Zertifikat wird **auf dem Host** von `setup.sh` per `openssl` erzeugt und via `docker cp`/Volume-Mount in die Container gebracht | Zertifikat wird **im Server selbst** während des Provisionierens erzeugt; `client` lädt es sich per `curl` von Port 80 selbst herunter (ausgenutzt wird Vagrants sequenzielle Boot-Reihenfolge: `server` ist fertig, bevor `client` startet) – kein Host-seitiges Kopieren zwischen VMs nötig |
+| Interface heißt `eth0` | Interface heißt `enp0s8` |
+| `analyst` sitzt im selben Docker-Bridge-Netz und sieht fremden Verkehr automatisch mit | `analyst` braucht in VirtualBox explizit Promiscuous Mode (`--nicpromisc2 allow-all`), weil er nicht aktiv im Pfad liegt und VirtualBox-NICs standardmäßig nur an sie adressierte Frames erhalten |
+| tcpdump/tshark-Befehle nutzen `eth0` und tcpdump-Flags (`-A`) | Befehle nutzen `enp0s8`; für tshark gilt `-x` statt tcpdump's `-A` |
+| Container über `docker exec -it` | echte VMs über `vagrant ssh` |
+
+---
+
+## Lab 05 – DNS Poisoning
+
+**Netzwerk:** `10.50.0.0/24`
+
+| VM | IP | Rolle |
+|---|---|---|
+| victim | 10.50.0.10 | Hauptopfer |
+| victim2 | 10.50.0.11 | zweites Opfer, zeigt den Cache-Effekt |
+| resolver | 10.50.0.53 | rekursiver, cachender Resolver (unbound) |
+| auth-dns | 10.50.0.54 | autoritativer Server für `bank.local` (nsd, DNSSEC-signiert) |
+| web-real | 10.50.0.20 | echtes Banking-Portal |
+| web-fake | 10.50.0.99 | Phishing-Klon |
+| attacker | 10.50.0.66 | Angreifer (ettercap) |
+
+```bash
+cd labs/lab-05-dns-poisoning
+vagrant up --provider=virtualbox
+```
+
+7 VMs – der erste `vagrant up` dauert entsprechend länger und braucht zusammen
+ca. 3 GB RAM.
+
+**Aufgabe 2 – Ausgangszustand (auf victim):**
+
+```bash
+vagrant ssh victim
+```
+
+```bash
+getent ahostsv4 bank.local
+curl -4 -s bank.local | grep -E "badge|Server:"
+```
+
+Sollte `10.50.0.20` und "ECHTES PORTAL" zeigen.
+
+**Aufgabe 3 – Szenario A (Angriff direkt am Client):**
+
+Auf `attacker`:
+
+```bash
+vagrant ssh attacker
+sudo ettercap -T -q -i enp0s8 -M arp:remote /10.50.0.10// /10.50.0.53// -P dns_spoof
+```
+
+Laufen lassen, dann in einem anderen Fenster:
+
+```bash
+vagrant ssh victim -c "getent ahostsv4 bank.local"
+vagrant ssh victim2 -c "getent ahostsv4 bank.local"
+```
+
+`victim` bekommt `10.50.0.99` (Phishing-Klon), `victim2` bleibt unbeeinflusst –
+der Angriff sitzt gezielt zwischen `victim` und `resolver`, `victim2` ist nicht
+betroffen. Angriff stoppen (`Strg+C`) und `victim` erneut fragen: die echte IP
+kommt sofort zurück, nichts bleibt "vergiftet".
+
+**Aufgabe 4 – Szenario B (Angriff am Resolver, wirkt auf alle Clients):**
+
+Cache leeren, dann Angreifer auf das andere IP-Paar ansetzen:
+
+```bash
+vagrant ssh resolver -c "sudo unbound-control flush_zone bank.local."
+```
+
+```bash
+vagrant ssh attacker
+sudo ettercap -T -q -i enp0s8 -M arp:remote /10.50.0.53// /10.50.0.54// -P dns_spoof
+```
+
+Eine einzelne Anfrage von `victim` reicht, um den Cache zu vergiften:
+
+```bash
+vagrant ssh victim -c "getent ahostsv4 bank.local"
+vagrant ssh resolver -c "sudo unbound-control dump_cache | grep bank.local"
+```
+
+Angriff stoppen, dann das bisher unbeteiligte `victim2` fragen:
+
+```bash
+vagrant ssh victim2 -c "getent ahostsv4 bank.local"
+```
+
+`victim2` bekommt trotzdem `10.50.0.99` – der Cache selbst ist vergiftet, nicht
+nur eine einzelne Verbindung. Das wirkt so lange wie die TTL des gefälschten
+Eintrags (bei ettercap standardmäßig 3600s), unabhängig davon, ob der
+Angreifer noch aktiv ist.
+
+**Aufgabe 5 – Szenario C (DNSSEC-Gegenmaßnahme):**
+
+```bash
+vagrant ssh resolver -c "sudo unbound-control flush_zone bank.local."
+vagrant ssh resolver -c "sudo enable-dnssec.sh"
+```
+
+Szenario B wiederholen (Angreifer auf `/10.50.0.53// /10.50.0.54//`), dann:
+
+```bash
+vagrant ssh victim -c "dig @10.50.0.53 bank.local"
+```
+
+Ergebnis: `SERVFAIL` statt der gefälschten IP – die unsignierte, gefälschte
+Antwort wird verworfen. Zum Vergleich ohne laufenden Angriff (Cache vorher
+leeren): dieselbe Abfrage liefert ganz normal `10.50.0.20`.
+
+> **Wichtige Beobachtung:** Wiederhole jetzt **Szenario A**
+> (`/10.50.0.10// /10.50.0.53//`) bei weiterhin aktiver DNSSEC-Validierung:
+>
+> ```bash
+> vagrant ssh victim -c "dig @10.50.0.53 bank.local +short"
+> ```
+>
+> `victim` wird **trotzdem** getäuscht (`10.50.0.99`) – DNSSEC schützt nur den
+> Weg zwischen validierendem Resolver und autoritativem Server, nicht die
+> "letzte Meile" zwischen Client und Resolver. Der Stub-Resolver von `victim`
+> validiert selbst nicht, sondern vertraut blind seinem Resolver.
+
+Danach zurücksetzen:
+
+```bash
+vagrant ssh resolver -c "sudo disable-dnssec.sh"
+```
+
+**Bonus – DNS over TLS:**
+
+```bash
+vagrant ssh resolver -c "sudo enable-dot.sh"
+```
+
+**Unterschiede zum Original (Docker-Lab):**
+
+| Original (Docker) | Diese Version (Vagrant) |
+|---|---|
+| DNS-Spoofing per `dsniff` (`arpspoof` + `dnsspoof`) | `dnsspoof` funktioniert auf dieser Ubuntu/VirtualBox-Kombination nicht zuverlässig (Traffic läuft nachweislich über den Angreifer, `dnsspoof` fängt ihn trotzdem nicht ab – vermutlich ein Kompatibilitätsproblem des alten, kaum noch gepflegten `dsniff`-Pakets). Stattdessen wie in Lab 02: **ettercap** mit `dns_spoof`-Plugin, das ARP-Poisoning und DNS-Fälschung in einem Tool erledigt |
+| `attacker`/`attacker-fwd`: zwei Container, weil `ip_forward` unter Docker Desktop/WSL2 zur Laufzeit nicht änderbar ist (`/proc/sys` read-only) – Szenario-Wechsel = kompletter Container-Neustart | ein einziger `attacker`; ettercap übernimmt im `arp:remote`-Modus das Weiterleiten selbst – kein manuelles `ip_forward`-Umschalten nötig, Szenario-Wechsel = nur anderes IP-Ziel-Paar |
+| Trust Anchor wird über ein Docker-Volume (`lab05-shared`) zwischen `auth-dns` und `resolver` geteilt | `auth-dns` stellt den Trust Anchor über einen simplen Python-`http.server` (Port 8090) bereit; `resolver` holt ihn sich per `curl` beim Aktivieren von DNSSEC – kein Host-seitiges Kopieren zwischen VMs, analog zum Zertifikats-Handoff in Lab 03 |
+| IPs werden dynamisch per `docker inspect` ermittelt und in `.attack-cmds` geschrieben | IPs sind von vornherein statisch (kein DHCP in den Labs), direkt im Vagrantfile und in `/etc/lab-info` hinterlegt |
+| `systemd-resolved` ist im Container kein Thema (Container haben kein eigenes systemd) | echte VMs haben `systemd-resolved` standardmäßig aktiv, das auf Port 53 (Loopback) bindet und mit `nsd`/`unbound`s `0.0.0.0`-Bind kollidiert (`Address already in use`) – muss auf `auth-dns`, `resolver`, `victim` und `victim2` vor dem Start der jeweiligen DNS-Dienste deaktiviert werden |
+| Interface heißt `eth0` | Interface heißt `enp0s8` |
+| Container über `docker exec -it` | echte VMs über `vagrant ssh` |
+
 ---
 
 ## Häufige Probleme
@@ -459,6 +628,22 @@ Interface mit der erwarteten IP haben.
 Kein Problem – jedes Lab hat sein eigenes isoliertes Netzwerk, sie
 beeinflussen sich nicht gegenseitig. Achte nur auf genug freien RAM
 (jede VM 512 MB–1 GB, je nach Lab).
+
+**Eigener DNS-Server (`nsd`/`unbound`) startet nicht, `systemctl status`
+zeigt "Address already in use" auf Port 53:**
+Ubuntu-VMs haben standardmäßig `systemd-resolved` aktiv, das auf
+`127.0.0.x:53` lauscht. Ein `0.0.0.0`-Bind eines eigenen DNS-Dienstes deckt
+das Loopback-Interface trotzdem mit ab und kollidiert deshalb. Vor dem
+Start des eigenen Dienstes deaktivieren:
+
+```bash
+sudo systemctl disable --now systemd-resolved
+sudo rm -f /etc/resolv.conf
+echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf
+```
+
+(Erst *nach* eventuellen `apt-get install`-Schritten, die noch funktionierendes
+DNS über den NAT-Adapter brauchen.)
 
 ---
 

